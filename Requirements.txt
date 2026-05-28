@@ -1,0 +1,7 @@
+# ICU Decision Support API — Requirements
+fastapi
+uvicorn[standard]
+langchain-ollama
+langgraph
+langchain-core
+pydantic
