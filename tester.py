@@ -1,10 +1,8 @@
-import os
+import subprocess
 
-class User:
-    pass
+password = "admin123"
 
-def login():
-    pass
-
-for i in range(5):
-    print(i)
+subprocess.Popen(
+    "ls",
+    shell=True
+)
