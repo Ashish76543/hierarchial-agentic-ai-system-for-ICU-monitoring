@@ -1,1 +1,1 @@
-password = "admin1g2"
+password = "admin1"
