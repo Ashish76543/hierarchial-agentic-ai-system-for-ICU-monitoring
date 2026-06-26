@@ -1,1 +1,2 @@
-password = "admi"
+password = "adm"
+
