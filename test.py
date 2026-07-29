@@ -1,1 +1,1 @@
-password = "minor changes for testing2 webhook"
+password = "minor changes for testi2 webhook"
