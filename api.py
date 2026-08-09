@@ -1,14 +1,18 @@
 """
 ICU Decision Support API
-Run with: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+Run:
+    uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 """
+
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
 
-from graph import graph  # imports the compiled LangGraph graph
+from graph import graph
+
 
 app = FastAPI(
     title="ICU Decision Support API",
@@ -16,35 +20,43 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ─────────────────────────────────────────────
-# CORS — adjust origins for your frontend URL
-# ─────────────────────────────────────────────
+
+# ============================================================
+# CORS
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # replace * with your frontend domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ─────────────────────────────────────────────
-# Request schema
-# ─────────────────────────────────────────────
+# ============================================================
+# REQUEST SCHEMA
+# ============================================================
+
 class ICURequest(BaseModel):
-    # Static patient info (unchanged across time window)
+    """
+    One current ICU snapshot plus the immediately preceding
+    one-hour snapshot used by the forecasting/prediction agents.
+    """
+
+    # Static patient information.
+    # Values may be numeric strings in the existing graph.
     static: Dict[str, str]
 
-    # Current readings (T=0 — most recent)
+    # Current snapshot (T=0).
     vitals: Dict[str, float]
     labs: Dict[str, float]
     gcs: Dict[str, float]
     ventilator: Dict[str, float]
     interventions: Dict[str, int]
-    outcomes: Optional[Dict[str, float]] = {}
+    outcomes: Optional[Dict[str, float]] = None
 
-    # Prior readings (T-1h — 1 hour ago)
-    # Required by forecast_agent and prediction_agent for trend analysis
+    # Previous snapshot (T-1h).
     prior_vitals: Dict[str, float]
     prior_labs: Dict[str, float]
     prior_gcs: Dict[str, float]
@@ -52,9 +64,10 @@ class ICURequest(BaseModel):
     prior_interventions: Dict[str, int]
 
 
-# ─────────────────────────────────────────────
-# Response schema
-# ─────────────────────────────────────────────
+# ============================================================
+# RESPONSE SCHEMAS
+# ============================================================
+
 class ForecastedVitals(BaseModel):
     heart_rate: float
     sbp: float
@@ -78,39 +91,82 @@ class PredictedOutcomes(BaseModel):
 
 
 class ICUResponse(BaseModel):
-    forecasted_vitals: Optional[ForecastedVitals]
-    predicted_outcomes: Optional[PredictedOutcomes]
-    clinical_summary: Optional[str]
-    severity_scores: Optional[Dict[str, Any]]
-    detected_syndromes: Optional[Dict[str, bool]]
-    selected_protocols: Optional[Dict[str, Optional[str]]]
-    recommended_interventions: Optional[Dict[str, int]]
-    recommended_ventilator_changes: Optional[Dict[str, Any]]
-    weaning_recommendation: Optional[Dict[str, int]]
-    escalation_decision: Optional[Dict[str, int]]
+    forecasted_vitals: Optional[ForecastedVitals] = None
+    predicted_outcomes: Optional[PredictedOutcomes] = None
+    clinical_summary: Optional[str] = None
+
+    # Fuzzy outputs: membership / recommendation strength.
+    severity_scores: Optional[Dict[str, Any]] = None
+    detected_syndromes: Optional[Dict[str, float]] = None
+    selected_protocols: Optional[Dict[str, float]] = None
+    escalation_decision: Optional[Dict[str, float]] = None
+    weaning_recommendation: Optional[Dict[str, float]] = None
+    recommended_interventions: Optional[Dict[str, float]] = None
+
+    # Numeric ventilator settings and mode information.
+    recommended_ventilator_changes: Optional[Dict[str, Any]] = None
 
 
-# ─────────────────────────────────────────────
-# Main inference endpoint
-# ─────────────────────────────────────────────
-@app.post("/api/analyze", response_model=ICUResponse, summary="Run ICU decision support pipeline")
+# ============================================================
+# HELPERS
+# ============================================================
+
+def model_to_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """
+    Convert a Pydantic model to a dictionary while also accepting
+    dictionaries returned directly by LangGraph.
+    """
+    if value is None:
+        return None
+
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+
+    if isinstance(value, dict):
+        return value
+
+    raise TypeError(
+        f"Expected a Pydantic model or dict, got {type(value).__name__}"
+    )
+
+
+# ============================================================
+# MAIN INFERENCE ENDPOINT
+# ============================================================
+
+@app.post(
+    "/api/analyze",
+    response_model=ICUResponse,
+    summary="Run ICU decision support pipeline",
+)
 async def analyze(request: ICURequest):
     """
-    Accepts current + prior (T-1h) patient ICU data and returns:
-    - Forecasted vitals (next interval)
-    - Predicted outcomes (discharge, mortality, sepsis, LOS)
-    - Clinical summary (trend + current + forecast + outcomes)
-    - Severity scores & detected syndromes
-    - Recommended interventions & ventilator settings
-    - Weaning / escalation decisions
+    Accept current + prior ICU data and run the complete graph.
+
+    Returns:
+      - Forecasted vitals
+      - Predicted outcomes
+      - Clinical summary
+      - Fuzzy severity scores
+      - Fuzzy syndrome memberships
+      - Fuzzy protocol memberships
+      - Fuzzy escalation scores
+      - Fuzzy weaning/readiness scores
+      - Fuzzy treatment recommendations
+      - Ventilator recommendations
     """
+
     state = {
         "messages": [],
 
-        # Static
+        # ----------------------------------------------------
+        # Static information
+        # ----------------------------------------------------
         "original_static": request.static,
 
-        # Current (T=0)
+        # ----------------------------------------------------
+        # Current snapshot
+        # ----------------------------------------------------
         "original_vitals": request.vitals,
         "original_labs": request.labs,
         "original_gcs": request.gcs,
@@ -118,19 +174,25 @@ async def analyze(request: ICURequest):
         "original_interventions": request.interventions,
         "original_outcomes": request.outcomes or {},
 
-        # Prior (T-1h)
+        # ----------------------------------------------------
+        # Previous snapshot
+        # ----------------------------------------------------
         "prior_vitals": request.prior_vitals,
         "prior_labs": request.prior_labs,
         "prior_gcs": request.prior_gcs,
         "prior_ventilator": request.prior_ventilator,
         "prior_interventions": request.prior_interventions,
 
-        # Previous agent outputs (empty on first call)
+        # ----------------------------------------------------
+        # Previous graph outputs
+        # ----------------------------------------------------
         "previous_forecasted_vitals": None,
         "previous_clinical_summary": None,
         "previous_outcomes": None,
 
-        # Graph outputs (all start as None)
+        # ----------------------------------------------------
+        # Current graph outputs
+        # ----------------------------------------------------
         "forecasted_vitals": None,
         "outcomes": None,
         "clinical_summary": None,
@@ -146,29 +208,95 @@ async def analyze(request: ICURequest):
 
     try:
         result = graph.invoke(state)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
 
-    forecasted = result.get("forecasted_vitals")
-    outcomes = result.get("outcomes")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline error: {type(exc).__name__}: {exc}",
+        ) from exc
 
-    return ICUResponse(
-        forecasted_vitals=ForecastedVitals(**forecasted.model_dump()) if forecasted else None,
-        predicted_outcomes=PredictedOutcomes(**outcomes.model_dump()) if outcomes else None,
-        clinical_summary=result.get("clinical_summary"),
-        severity_scores=result.get("severity_scores"),
-        detected_syndromes=result.get("detected_syndromes"),
-        selected_protocols=result.get("selected_protocols"),
-        recommended_interventions=result.get("recommended_interventions"),
-        recommended_ventilator_changes=result.get("recommended_ventilator_changes"),
-        weaning_recommendation=result.get("weaning_recommendation"),
-        escalation_decision=result.get("escalation_decision"),
+    # --------------------------------------------------------
+    # Convert graph outputs
+    # --------------------------------------------------------
+
+    forecasted = model_to_dict(
+        result.get("forecasted_vitals")
     )
 
+    outcomes = model_to_dict(
+        result.get("outcomes")
+    )
 
-# ─────────────────────────────────────────────
-# Health check
-# ─────────────────────────────────────────────
-@app.get("/health", summary="Health check")
+    # --------------------------------------------------------
+    # Build response
+    # --------------------------------------------------------
+
+    try:
+        return ICUResponse(
+            forecasted_vitals=(
+                ForecastedVitals(**forecasted)
+                if forecasted is not None
+                else None
+            ),
+
+            predicted_outcomes=(
+                PredictedOutcomes(**outcomes)
+                if outcomes is not None
+                else None
+            ),
+
+            clinical_summary=result.get(
+                "clinical_summary"
+            ),
+
+            severity_scores=result.get(
+                "severity_scores"
+            ),
+
+            detected_syndromes=result.get(
+                "detected_syndromes"
+            ),
+
+            selected_protocols=result.get(
+                "selected_protocols"
+            ),
+
+            escalation_decision=result.get(
+                "escalation_decision"
+            ),
+
+            weaning_recommendation=result.get(
+                "weaning_recommendation"
+            ),
+
+            recommended_interventions=result.get(
+                "recommended_interventions"
+            ),
+
+            recommended_ventilator_changes=result.get(
+                "recommended_ventilator_changes"
+            ),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Graph returned data that does not match the API "
+                f"response schema: {type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get(
+    "/health",
+    summary="Health check",
+)
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
